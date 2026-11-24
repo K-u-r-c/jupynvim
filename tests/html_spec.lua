@@ -166,5 +166,50 @@ assert(amp, "&amp; shows as &")
 print("8. markdown hookup ok")
 
 vim.fn.delete(dir, "rf")
+
+-- 9. tmux: one passthrough per kitty escape. tmux drops a sequence longer
+-- than input-buffer-size (1 MiB), and a photo is ~2.5 MB of base64.
+local Image = require("jupynvim.notebook.image")
+local big = string.rep("A", 3 * 1024 * 1024)
+local esc = {}
+for i = 1, #big, 4096 do
+  esc[#esc + 1] = string.format("\27_Gm=%d,q=2;%s\27\\", (i + 4096 <= #big) and 1 or 0, big:sub(i, i + 4095))
+end
+esc = table.concat(esc)
+local wrapped = Image._tmux_wrap(esc)
+local unwrapped, longest, count = {}, 0, 0
+for seq in wrapped:gmatch("\27Ptmux;(.-\27\27\\)\27\\") do
+  count = count + 1
+  longest = math.max(longest, #seq)
+  unwrapped[#unwrapped + 1] = (seq:gsub("\27\27", "\27"))
+end
+assert(count == math.ceil(#big / 4096), "one passthrough per escape, got " .. count)
+assert(longest < 16 * 1024, "every passthrough is small, longest " .. longest)
+assert(table.concat(unwrapped) == esc, "unwrapping gives the escapes back")
+print("9. tmux passthrough per escape ok")
+
+-- 10. a large image is shrunk to its box before it is sent
+if vim.fn.executable("magick") == 1 then
+  local src = vim.fn.tempname() .. ".png"
+  vim.fn.system({ "magick", "-size", "1024x1024", "plasma:", src })
+  local fh = io.open(src, "rb"); local bytes = fh:read("*a"); fh:close()
+  os.remove(src)
+  local sent
+  Image._send_hook = function(method, a)
+    if method == "kitty_transmit_virtual" then sent = a.png_b64 end
+    return { image_id = a.image_id }
+  end
+  Image.ensure_transmitted("spec_resize", vim.base64.encode(bytes), function() end,
+    { renderer = "placeholder", mime = "image/png", rows = 8, cols = 17, max_px = "340x320" })
+  Image._send_hook = nil
+  assert(sent, "image was sent")
+  local w, h = L.dimensions(vim.base64.decode(sent):sub(1, 64), "image/png")
+  assert(w <= 340 and h <= 320, "sent at " .. tostring(w) .. "x" .. tostring(h))
+  assert(#sent < #vim.base64.encode(bytes) / 4, "the shrunk image is much smaller")
+  print("10. large image shrunk to its box ok (" .. w .. "x" .. h .. ")")
+else
+  print("10. skipped (no ImageMagick)")
+end
+
 print("ALL HTML CHECKS PASSED")
 vim.cmd("qa!")

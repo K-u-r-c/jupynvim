@@ -180,10 +180,21 @@ local IN_TMUX = (vim.env.TMUX ~= nil and vim.env.TMUX ~= "")
   and not (vim.env.JUPYNVIM_DISABLE_TMUX_PASSTHROUGH ~= nil
            and vim.env.JUPYNVIM_DISABLE_TMUX_PASSTHROUGH ~= "")
 
+-- One passthrough per escape: tmux drops a sequence longer than its
+-- input-buffer-size (1 MiB by default), and a whole image sent as a single
+-- passthrough is easily that (a 1024px photo is ~2.5 MB of base64). Each
+-- kitty chunk is 4 KB, so wrapped one by one they always get through.
 local function tmux_wrap(s)
-  local doubled = s:gsub("\27", "\27\27")
-  return "\27Ptmux;" .. doubled .. "\27\\"
+  local out, pos, n = {}, 1, #s
+  while pos <= n do
+    local e = s:find("\27\\", pos, true)
+    local seq = e and s:sub(pos, e + 1) or s:sub(pos)
+    out[#out + 1] = "\27Ptmux;" .. (seq:gsub("\27", "\27\27")) .. "\27\\"
+    pos = e and (e + 2) or (n + 1)
+  end
+  return table.concat(out)
 end
+M._tmux_wrap = tmux_wrap
 
 local function tty_write(s)
   M._tty_n = (M._tty_n or 0) + 1
@@ -321,6 +332,8 @@ end
 -- RPC dispatch to backend's kitty handlers (LOCAL mode), or local encode +
 -- direct tty write (REMOTE mode). Synchronous shape — returns res or nil+err.
 local function kitty_call_sync(method, args, timeout)
+  -- specs see what would go to the terminal
+  if M._send_hook then return M._send_hook(method, args or {}) end
   if M._remote_mode then
     local esc = encode_local(method, args or {})
     if esc then tty_write(esc) end
@@ -509,8 +522,10 @@ end
 -- on success, nil on failure. Callers must handle nil (typically by falling
 -- back to a renderer that can read the source format directly, like chafa).
 local _warned_missing_magick = false
-local function ensure_png(b64, mime, callback)
-  if mime == nil or mime == "image/png" or mime == "" then
+-- resize: optional ImageMagick geometry ("340x320"); a larger image is
+-- shrunk to fit it, so a photo shown in a small box is not sent full size.
+local function ensure_png(b64, mime, callback, resize)
+  if (mime == nil or mime == "image/png" or mime == "") and not resize then
     callback(b64); return
   end
   if vim.fn.executable("magick") ~= 1 and vim.fn.executable("convert") ~= 1 then
@@ -537,9 +552,10 @@ local function ensure_png(b64, mime, callback)
   -- outside the quotes where zsh tries to glob it and aborts the command.
   local frame0 = vim.fn.shellescape(in_path .. "[0]")
   local out_q = vim.fn.shellescape(out_path)
+  local rs = resize and (" -resize " .. vim.fn.shellescape(resize .. ">")) or ""
   local cmd = string.format(
-    "magick %s %s 2>/dev/null || convert %s %s 2>/dev/null",
-    frame0, out_q, frame0, out_q)
+    "magick %s%s %s 2>/dev/null || convert %s%s %s 2>/dev/null",
+    frame0, rs, out_q, frame0, rs, out_q)
   vim.fn.system(cmd)
   pcall(os.remove, in_path)
   if vim.v.shell_error ~= 0 or vim.fn.filereadable(out_path) ~= 1 then
@@ -703,9 +719,12 @@ function M.ensure_transmitted(cell_id, b64, callback, opts)
   -- chafa accepts any format directly via tempfile.
   -- If conversion fails (no magick, or unsupported source), fall through to
   -- chafa so the user sees something rather than a blank cell.
-  if mime and mime ~= "image/png" and renderer ~= "chafa" then
+  -- opts.max_px: shrink to this geometry first (images from a markdown cell)
+  local resize = (opts.max_px and not opts._resized and renderer ~= "chafa") and opts.max_px or nil
+  if (mime and mime ~= "image/png" and renderer ~= "chafa") or resize then
     ensure_png(b64, mime, function(png_b64)
       if png_b64 then
+        opts._resized = true
         opts.mime = "image/png"
         opts._gif_b64 = (mime == "image/gif" and renderer == "placeholder") and b64 or nil
         M.ensure_transmitted(cell_id, png_b64, callback, opts)
@@ -716,7 +735,7 @@ function M.ensure_transmitted(cell_id, b64, callback, opts)
       else
         callback(nil)
       end
-    end)
+    end, resize)
     return
   end
   local id = next_image_id()

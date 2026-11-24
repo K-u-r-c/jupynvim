@@ -402,7 +402,13 @@ local function markdown_ctx(nb, cell, win, lead, extra_below, hidden)
         else
           nb._html_img_failed[key] = true
         end
-      end, { renderer = renderer, mime = e.mime, rows = ref.rows, cols = ref.cols })
+      end, {
+        renderer = renderer, mime = e.mime, rows = ref.rows, cols = ref.cols,
+        -- a cell is ~10x20 px, x2 for HiDPI: enough pixels for the box, and a
+        -- 1024px photo in a 17x8 box goes out at ~100 KB instead of 2.5 MB
+        max_px = (e.w and e.h and (e.w > ref.cols * 20 or e.h > ref.rows * 40))
+          and string.format("%dx%d", ref.cols * 20, ref.rows * 40) or nil,
+      })
       return nil
     end,
     below = function(lnum, vl)

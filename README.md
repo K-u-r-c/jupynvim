@@ -58,6 +58,14 @@ https://github.com/user-attachments/assets/2a3fbd17-561d-4c37-b856-a912944f88f8
   `python -m ipykernel install --user --name foo` per project.
 - Multi-image markdown cells are supported. `<leader>nD` deletes one image
   and `u` brings it back.
+- Raw HTML in markdown cells is drawn instead of shown as source: headings,
+  paragraphs, `<br>`, lists, `<pre>`, layout tables (an image cell next to a
+  text cell, the way course banners are built) and data tables, bold /
+  italic / links, and CSS or `<font>` colors (nudged until they read on your
+  background). `<img src="...">` and `![alt](plot.png)` show local images,
+  relative to the notebook, and `data:` URIs; remote URLs show their alt
+  text, nothing is downloaded. The cell source is never rewritten: editing
+  the cell shows the real HTML, and `:w` saves it as it was.
 - Remote over SSH. Connect to a machine or HPC cluster and edit notebooks
   whose files and kernels live there, with a remote file browser, PTY
   terminals, and ripgrep search, all over one `ssh` connection. Works even
@@ -615,6 +623,14 @@ everywhere, but consumes a small amount of CPU while playing.
 
 One backend instance is shared across all open notebooks. Restarting it
 with `:JupynvimReset` restarts every kernel.
+
+HTML in markdown cells is a terminal-sized subset, not a browser. Tables,
+headings, lists, colors and images are laid out; CSS boxes, floats, widths in
+percent and fonts are not. A `<br>` inside an ordinary markdown paragraph
+shows as a space, since an overlay cannot break the real line (inside an HTML
+block it breaks the line). Images inside HTML are drawn with the
+`placeholder` renderer; with `kitty` they show their alt text, and with
+`chafa` the ASCII art is cut to the image's box.
 
 Remote LSP is partial. Kernel-driven completion and hover work over SSH, but
 running a full editor language server on the remote and relaying it is still

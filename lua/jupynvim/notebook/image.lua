@@ -655,7 +655,11 @@ function M.ensure_transmitted(cell_id, b64, callback, opts)
   local renderer = opts.renderer or "chafa"
   local mime = opts.mime
   local src_hash = opts._src_hash or quick_hash(b64)
-  local want = opts._want or renderer
+  -- opts.rows / opts.cols: this image's own box (an <img> in a markdown cell),
+  -- else the configured image size
+  local box_rows = (type(opts.rows) == "number" and opts.rows > 0) and math.floor(opts.rows) or PLACEHOLDER_ROWS
+  local box_cols = (type(opts.cols) == "number" and opts.cols > 0) and math.floor(opts.cols) or PLACEHOLDER_COLS
+  local want = opts._want or ((opts.rows or opts.cols) and (renderer .. ":" .. box_rows .. "x" .. box_cols) or renderer)
   local existing = placements[cell_id]
   if existing and existing.src_hash == src_hash and existing.want == want then
     callback(existing.image_id)
@@ -721,10 +725,10 @@ function M.ensure_transmitted(cell_id, b64, callback, opts)
     -- Real PNG via Kitty Unicode placeholder protocol — image stays
     -- anchored to buffer text because placeholders ARE text.
     log.debug(string.format("placeholder: cell=%s id=%d transmitting %d b64 chars (%dx%d cells)",
-      cell_id, id, #b64, PLACEHOLDER_COLS, PLACEHOLDER_ROWS))
+      cell_id, id, #b64, box_cols, box_rows))
     local _, terr = kitty_call_sync("kitty_transmit_virtual", {
       image_id = id, png_b64 = b64,
-      cols = PLACEHOLDER_COLS, rows = PLACEHOLDER_ROWS,
+      cols = box_cols, rows = box_rows,
     })
     if terr then
       log.warn(string.format("placeholder: cell=%s id=%d transmit FAILED: %s", cell_id, id, tostring(terr)))
@@ -735,14 +739,14 @@ function M.ensure_transmitted(cell_id, b64, callback, opts)
     local p = {
       image_id = id, png_hash = h, b64 = b64, src_hash = src_hash, want = want,
       placement_id = 1, renderer = "placeholder",
-      rows = PLACEHOLDER_ROWS, cols = PLACEHOLDER_COLS,
+      rows = box_rows, cols = box_cols,
     }
     placements[cell_id] = p
     -- one-time cleanup: drop any anonymous placements this image id may
     -- have accumulated in the terminal (older sessions used a=T per
     -- frame), leaving exactly the explicit p=1 placement
     kitty_call_async("kitty_place_virtual", {
-      image_id = id, cols = PLACEHOLDER_COLS, rows = PLACEHOLDER_ROWS,
+      image_id = id, cols = box_cols, rows = box_rows,
     })
     log.debug(string.format("placeholder: cell=%s id=%d transmitted ok, fg=#%06x",
       cell_id, id, id))

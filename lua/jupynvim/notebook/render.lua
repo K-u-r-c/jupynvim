@@ -345,6 +345,75 @@ local function footer_chunks(total_w, gut, bc, label, cell, st, border_hl)
 end
 M._footer_chunks = footer_chunks
 
+-- What markdown.lua needs to draw images a markdown cell points at
+-- (<img src="...">, ![alt](file.png)) and to hang lines under a buffer line.
+-- Images are read from disk relative to the notebook (localimg.lua), sent to
+-- the terminal once per size, and the cell is redrawn when one arrives.
+local function markdown_ctx(nb, cell, win, lead, extra_below, hidden)
+  local LocalImg = require("jupynvim.notebook.localimg")
+  local cfg = require("jupynvim").config or {}
+  local renderer = cfg.image_renderer or "chafa"
+  local dir = LocalImg.notebook_dir(nb.path)
+  nb.image_ids = nb.image_ids or {}
+  nb._html_img_failed = nb._html_img_failed or {}
+  nb._html_img_key = nb._html_img_key or {}
+  return {
+    lead = lead,
+    max_cols = cfg.image_cols or 48,
+    max_rows = cfg.image_rows or 16,
+    cache_key = (dir or "") .. "|" .. tostring(cfg.image_cols) .. "x" .. tostring(cfg.image_rows),
+    image = function(src)
+      if renderer == "kitty" then return nil end
+      return LocalImg.load(src, dir, false)
+    end,
+    resolve = function(ref)
+      local e = LocalImg.load(ref.src, dir, true)
+      if not e or not e.b64 then return nil end
+      local key = cell.id .. "_html_" .. e.hash .. "_" .. ref.cols .. "x" .. ref.rows
+      if nb.image_ids[key] then
+        if renderer == "placeholder" then return image.placeholder_virt_lines(key) end
+        local ascii = image.ascii_lines_for(key)
+        if not ascii then return nil end
+        local rows = {}
+        for i = 1, ref.rows do
+          local l = ascii[i] or ""
+          local w = vim.api.nvim_strwidth(l)
+          if w > ref.cols then
+            l = vim.fn.strcharpart(l, 0, ref.cols)
+            w = vim.api.nvim_strwidth(l)
+          end
+          rows[i] = { { l .. string.rep(" ", math.max(ref.cols - w, 0)), "Normal" } }
+        end
+        return rows
+      end
+      if nb._html_img_failed[key] then return nil end
+      -- the same picture at another size (the window got narrower): free it
+      local slot = cell.id .. "_html_" .. e.hash .. "_" .. (ref.src or "")
+      local prev = nb._html_img_key[slot]
+      if prev and prev ~= key then
+        image.clear_for_cell(prev)
+        nb.image_ids[prev] = nil
+      end
+      nb._html_img_key[slot] = key
+      image.ensure_transmitted(key, e.b64, function(id)
+        if id then
+          nb.image_ids[key] = id
+          vim.schedule(function() M.refresh(nb, win) end)
+        else
+          nb._html_img_failed[key] = true
+        end
+      end, { renderer = renderer, mime = e.mime, rows = ref.rows, cols = ref.cols })
+      return nil
+    end,
+    below = function(lnum, vl)
+      local t = extra_below[lnum] or {}
+      for _, l in ipairs(vl) do t[#t + 1] = l end
+      extra_below[lnum] = t
+    end,
+    hide = function(lnum) hidden[lnum] = true end,
+  }
+end
+
 -- Render a single cell. `geom` = { gut, width, total_w }: statuscolumn
 -- width, text-area width, full window width. `editing` = this cell is the
 -- one being edited (markdown cells get a source-editor box while edited,
@@ -366,6 +435,14 @@ local function render_cell(nb, cell, range, geom, win, cellno, selected, editing
     -- on an extmark re-render and can never linger over the gif/image.
     local md_lead = repeat_char(" ", gut)
     local lines_below = {}
+    -- lines the markdown renderer hangs under buffer lines (HTML blocks,
+    -- images from files), and the lines it hides whole
+    local extra_below, hidden = {}, {}
+    if cell.cell_type == "markdown" then
+      require("jupynvim.notebook.markdown").render(buf, nb.border_ns,
+        range.start, math.min(range.stop - 1, total - 1), width,
+        markdown_ctx(nb, cell, win, md_lead, extra_below, hidden))
+    end
     if cell.cell_type == "markdown" then
       local Embedded = require("jupynvim.notebook.embedded")
       local src = cell.source or ""
@@ -392,6 +469,22 @@ local function render_cell(nb, cell, range, geom, win, cellno, selected, editing
     table.insert(lines_below, { { " ", "Normal" } })
     local last = math.max(range.stop - 1, range.start)
     if last >= total then last = total - 1 end
+    -- virt_lines on a hidden line are not drawn: hang them on the last shown one
+    while last > range.start and hidden[last] do last = last - 1 end
+    -- what the markdown renderer hung on that same line goes first, in this
+    -- one extmark, so the order of the rows is fixed
+    if extra_below[last] then
+      local merged = extra_below[last]
+      for _, l in ipairs(lines_below) do merged[#merged + 1] = l end
+      lines_below = merged
+      extra_below[last] = nil
+    end
+    for lnum, vl in pairs(extra_below) do
+      vim.api.nvim_buf_set_extmark(buf, nb.border_ns, lnum, 0, {
+        virt_lines = vl,
+        virt_lines_leftcol = true,
+      })
+    end
     if last >= 0 then
       vim.api.nvim_buf_set_extmark(buf, nb.border_ns, last, 0, {
         virt_lines = lines_below,
@@ -399,8 +492,6 @@ local function render_cell(nb, cell, range, geom, win, cellno, selected, editing
       })
     end
     if cell.cell_type == "markdown" then
-      require("jupynvim.notebook.markdown").render(buf, nb.border_ns,
-        range.start, math.min(range.stop - 1, total - 1), width)
       local Embedded = require("jupynvim.notebook.embedded")
       local imgs = Embedded.list_images(cell.id)
       if imgs and #imgs > 0 then

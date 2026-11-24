@@ -9,6 +9,12 @@
 
 local M = {}
 
+local Html = require("jupynvim.notebook.html")
+
+-- The render context of the cell being drawn (images, virt_lines under a
+-- line, lines hidden), set by M.render for its helpers. nil = no images.
+local cur_ctx = nil
+
 -- Highlight groups (defined in setup_hl)
 local HL = {
   H1   = "JupynvimMdH1",
@@ -216,7 +222,96 @@ function M.link_at(line, col)
   return links[1]
 end
 
+-- Images under a line: laid out like an HTML <img>, hung below the line.
+local function images_below(buf, ns, lnum, nodes, width)
+  if #nodes == 0 then return end
+  local html = {}
+  for _, n in ipairs(nodes) do html[#html + 1] = n end
+  local lines = Html.layout(table.concat(html, "<br>"), width or 80, cur_ctx)
+  local vl = Html.to_virt_lines(lines, cur_ctx and cur_ctx.resolve, cur_ctx and cur_ctx.lead)
+  if cur_ctx and cur_ctx.below then
+    cur_ctx.below(lnum, vl)
+  elseif #vl > 0 then
+    set_mark(buf, ns, lnum, 0, { virt_lines = vl })
+  end
+end
+
+local function html_escape(s)
+  return (s:gsub("&", "&amp;"):gsub('"', "&quot;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+-- Inline HTML in a markdown line: tags are hidden, <b>/<span style="color">
+-- and the like style the text between an open and a close tag on the same
+-- line, and an <img> shows under the line (or its alt text in place).
+local function inline_html(buf, ns, lnum, line)
+  local has_tag, has_ent = line:find("<", 1, true), line:find("&", 1, true)
+  if not has_tag and not has_ent then return end
+  local code = {}
+  for a, b in line:gmatch("()`[^`]+`()") do code[#code + 1] = { a, b - 1 } end
+  local function in_code(pos)
+    for _, r in ipairs(code) do
+      if pos >= r[1] and pos <= r[2] then return true end
+    end
+    return false
+  end
+  -- entities (&amp; &nbsp; &#8594;) show as the character they stand for
+  if has_ent then
+    for a, ent, b in line:gmatch("()(&#?[%w]+;)()") do
+      local ch = Html.decode(ent)
+      if ch ~= ent and not in_code(a) and vim.api.nvim_strwidth(ch) <= 1
+         and vim.fn.strchars(ch) <= 1 then
+        conceal_range(buf, ns, lnum, a - 1, b - 1, ch == "\194\160" and " " or ch)
+      end
+    end
+  end
+  if not has_tag then return end
+  local tags = Html.inline_tags(line)
+  if #tags == 0 then return end
+  local open, imgs = {}, {}
+  for _, t in ipairs(tags) do
+    if not in_code(t.s) then
+      if t.name == "img" then
+        local ref = Html.image_ref(t, (cur_ctx and cur_ctx.width) or 80, cur_ctx)
+        if ref.ok then
+          conceal_range(buf, ns, lnum, t.s - 1, t.e, "")
+          imgs[#imgs + 1] = line:sub(t.s, t.e)
+        else
+          local label = (t.attrs.alt and t.attrs.alt ~= "") and t.attrs.alt or "image"
+          set_mark(buf, ns, lnum, t.s - 1, {
+            end_col = t.e, conceal = "",
+            virt_text = { { "🖼 " .. label, HL.Link } }, virt_text_pos = "inline",
+            hl_mode = "combine", priority = 105,
+          })
+        end
+      else
+        -- a <br> cannot break the real line: it shows as a space
+        conceal_range(buf, ns, lnum, t.s - 1, t.e, t.name == "br" and " " or "")
+        if t.close then
+          for k = #open, 1, -1 do
+            if open[k].name == t.name then
+              local stack = {}
+              for j = 1, k do stack[j] = open[j] end
+              local hl = Html.hl_for(Html.inline_style(stack))
+              if hl ~= "Normal" and t.s - 1 > open[k].e then
+                set_mark(buf, ns, lnum, open[k].e, {
+                  end_col = t.s - 1, hl_group = hl, hl_mode = "combine", priority = 95,
+                })
+              end
+              for _ = #open, k, -1 do table.remove(open) end
+              break
+            end
+          end
+        elseif not t.selfclose and not Html.VOID[t.name] and t.name ~= "!--" then
+          open[#open + 1] = t
+        end
+      end
+    end
+  end
+  if #imgs > 0 then images_below(buf, ns, lnum, imgs, cur_ctx and cur_ctx.width) end
+end
+
 local function inline_styling(buf, ns, lnum, line)
+  inline_html(buf, ns, lnum, line)
   -- Links FIRST (balanced-bracket scan), marking their spans so emphasis
   -- regexes don't fire inside URLs.
   for _, l in ipairs(find_links(line)) do
@@ -629,24 +724,82 @@ end
 -- Apply markdown extmarks to lines [start_line, end_line] (0-based, inclusive)
 -- in `buf`, in namespace `ns`. Multi-line constructs (fenced code blocks,
 -- block math) are tracked via a small state machine.
-function M.render(buf, ns, start_line, end_line, render_width)
+-- An HTML block (lines first..last of `lines`, 1-based): its first line is
+-- kept as an empty row the rendered HTML hangs under, the rest are hidden.
+-- virt_lines on a concealed line are not drawn, hence the one kept row.
+local function render_html_block(buf, ns, start_line, lines, first, last, width)
+  local html = table.concat(lines, "\n", first, last)
+  local out = Html.layout(html, width, cur_ctx)
+  local l0 = start_line + first - 1
+  set_mark(buf, ns, l0, 0, { end_col = #lines[first], conceal = "", priority = 200 })
+  if last > first then
+    set_mark(buf, ns, l0 + 1, 0, {
+      end_row = start_line + last - 1, end_col = #lines[last], conceal_lines = "",
+    })
+    if cur_ctx and cur_ctx.hide then
+      for l = l0 + 1, start_line + last - 1 do cur_ctx.hide(l) end
+    end
+  end
+  if #out == 0 then return end
+  local vl = Html.to_virt_lines(out, cur_ctx and cur_ctx.resolve, cur_ctx and cur_ctx.lead)
+  if cur_ctx and cur_ctx.below then
+    cur_ctx.below(l0, vl)
+  else
+    set_mark(buf, ns, l0, 0, { virt_lines = vl })
+  end
+end
+
+-- A line that is only a markdown image of a local file: `![alt](plots/a.png)`.
+-- The line is hidden and the image hangs under it. Returns true when handled.
+local function render_md_image(buf, ns, lnum, raw, width)
+  if not cur_ctx or not cur_ctx.image then return false end
+  local alt, src = raw:match("^%s*!%[([^%]]*)%]%(%s*<?([^%s>)]+)>?[^)]*%)%s*$")
+  if not src or src:match("^jupynvim%-img:") or src:match("^data:") then return false end
+  if not cur_ctx.image(src) then return false end
+  set_mark(buf, ns, lnum, 0, { end_col = #raw, conceal = "", priority = 200 })
+  images_below(buf, ns, lnum,
+    { string.format('<img src="%s" alt="%s">', html_escape(src), html_escape(alt)) }, width)
+  return true
+end
+
+-- ctx (optional, from render.lua): {
+--   image(src) -> {w, h} | nil     a local image is available (and its size)
+--   resolve(ref) -> rows | nil     its placeholder rows once transmitted
+--   below(lnum, virt_lines)        hang lines under a buffer line
+--   hide(lnum)                     a line is concealed whole
+--   lead, width, max_cols, max_rows
+-- }
+function M.render(buf, ns, start_line, end_line, render_width, ctx)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local total = vim.api.nvim_buf_line_count(buf)
   if start_line >= total then return end
   end_line = math.min(end_line, total - 1)
   local lines = vim.api.nvim_buf_get_lines(buf, start_line, end_line + 1, false)
+  cur_ctx = ctx
+  if ctx and not ctx.width then ctx.width = render_width end
+  local ok, err = pcall(M._render_lines, buf, ns, start_line, lines, render_width)
+  cur_ctx = nil
+  if not ok then error(err, 0) end
+end
+
+function M._render_lines(buf, ns, start_line, lines, render_width)
   local heading_width = render_width or 60
+  -- Pre-pass: raw HTML blocks (CommonMark rules), drawn by html.lua.
+  local claimed = {}
+  for _, b in ipairs(Html.blocks(lines)) do
+    render_html_block(buf, ns, start_line, lines, b.first, b.last, math.max((render_width or 80) - 1, 8))
+    for r = b.first, b.last do claimed[r] = true end
+  end
 
   -- Pre-pass: pipe tables (outside fences). Rows claimed by a table are
   -- rendered here and skipped by the per-line pass below.
-  local claimed = {}
   do
     local fence = false
     local i = 1
     while i <= #lines do
       local raw = lines[i]
       if raw:match("^%s*```") then fence = not fence end
-      if not fence and raw:find("|") and not is_table_sep(raw)
+      if not fence and not claimed[i] and raw:find("|") and not is_table_sep(raw)
          and lines[i + 1] and is_table_sep(lines[i + 1]) then
         local first, last = i, i + 1
         local j = i + 2
@@ -715,7 +868,7 @@ function M.render(buf, ns, start_line, end_line, render_width)
           hl_mode = "combine",
           priority = 200,
         })
-      else
+      elseif not render_md_image(buf, ns, lnum, raw, render_width) then
         apply_line(buf, ns, lnum, raw)
         -- ATX heading: NO underline virt_line. The styled heading text speaks for itself.
       end

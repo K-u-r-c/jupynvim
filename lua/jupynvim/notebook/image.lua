@@ -196,11 +196,38 @@ local function tmux_wrap(s)
 end
 M._tmux_wrap = tmux_wrap
 
+-- Neovim 0.12+: hand the bytes to the terminal UI (nvim_ui_send), which writes
+-- them in order with its own screen output. Written beside it (v:stderr), an
+-- image escape can land inside a redraw and the terminal puts rows in the
+-- wrong place: lines drawn twice, a cell one row too tall. A UI without
+-- stdout_tty (a GUI, nvim --headless) does not take them: the old paths stay.
+local function ui_send(s)
+  if not vim.api.nvim_ui_send then return false end
+  local ok, uis = pcall(vim.api.nvim_list_uis)  -- errors in a fast callback
+  if not ok then return false end
+  for _, ui in ipairs(uis) do
+    if ui.stdout_tty then
+      if pcall(vim.api.nvim_ui_send, s) then
+        M._ui_send_n = (M._ui_send_n or 0) + 1
+        return true
+      end
+      return false
+    end
+  end
+  return false
+end
+
 local function tty_write(s)
   M._tty_n = (M._tty_n or 0) + 1
   M._tty_bytes = (M._tty_bytes or 0) + #s
   if IN_TMUX then s = tmux_wrap(s) end
   local uv = vim.uv
+
+  -- 0) through the terminal UI, in order with the screen (Neovim 0.12+)
+  if ui_send(s) then
+    log.debug(string.format("tty_write nvim_ui_send %d bytes ok", #s))
+    return true
+  end
 
   -- 1) chansend(vim.v.stderr, ...) — this is what image.nvim uses. vim.v.stderr
   -- is a channel ID that always points at nvim's stderr stream, which the TUI

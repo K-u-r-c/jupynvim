@@ -37,6 +37,10 @@ local HL_OK         = "JupynvimExecOk"
 local HL_MORE       = "JupynvimOutputMore"
 local HL_SEPARATOR  = "JupynvimSeparator"
 
+-- Priority of the plain-text mask over an output region. Markdown and HTML
+-- outputs draw their marks above it.
+local OUT_MASK_PRIORITY = 5000
+
 local function repeat_char(ch, n)
   if n <= 0 then return "" end
   return string.rep(ch, n)
@@ -548,13 +552,45 @@ local function render_cell(nb, cell, range, geom, win, cellno, selected, editing
       end
     end
   end
+  -- Markdown and HTML outputs (Markdown(...), HTML(...)) are drawn like a
+  -- markdown cell, under the output's two-space indent. Only when the buffer
+  -- holds the rows the cache describes: a render can run before the
+  -- debounced buffer write puts new output lines in.
+  local out_rich, out_below, out_hidden = {}, {}, {}
+  if cell.cell_type == "code" and range.out_sep and range.out_stop and range.out_stop <= total then
+    local rich = Notebook.output_rich(cell)
+    if #rich > 0 and range.out_stop - range.out_sep - 1 == #Notebook.output_lines(cell) then
+      local Markdown = require("jupynvim.notebook.markdown")
+      for _, s in ipairs(rich) do
+        local a, b = range.out_sep + s[1], range.out_sep + s[2]
+        for r = a, b do out_rich[r] = true end
+        local ctx = markdown_ctx(nb, cell, win, sub_lead .. "  ", out_below, out_hidden)
+        ctx.col, ctx.priority, ctx.html = 2, OUT_MASK_PRIORITY + 1, s[3] == "html"
+        pcall(Markdown.render, buf, nb.border_ns, a, b, math.max(width - 2, 8), ctx)
+      end
+    end
+  end
+
   -- spacer so the next cell's top border doesn't glue to our outputs;
   -- when the cell has a real output region it goes after THOSE lines
   if range.out_sep and range.out_stop then
     local last_out = math.min(range.out_stop, total) - 1
+    -- virt_lines on a hidden line are not drawn (an HTML output hides all
+    -- but its first row), and lines hung on the same row go in one extmark
+    -- so their order is fixed
+    while last_out > range.out_sep and out_hidden[last_out] do last_out = last_out - 1 end
     if last_out >= 0 then
+      local vl = out_below[last_out] or {}
+      out_below[last_out] = nil
+      vl[#vl + 1] = { { " ", "Normal" } }
       pcall(vim.api.nvim_buf_set_extmark, buf, nb.border_ns, last_out, 0, {
-        virt_lines = { { { " ", "Normal" } } },
+        virt_lines = vl,
+        virt_lines_leftcol = true,
+      })
+    end
+    for lnum, vl in pairs(out_below) do
+      pcall(vim.api.nvim_buf_set_extmark, buf, nb.border_ns, lnum, 0, {
+        virt_lines = vl,
         virt_lines_leftcol = true,
       })
     end
@@ -591,24 +627,34 @@ local function render_cell(nb, cell, range, geom, win, cellno, selected, editing
   -- Output regions are real buffer lines in a python-filetype buffer, so
   -- treesitter/semantic tokens would paint them like code. Mask the whole
   -- region with a high-priority plain foreground: outputs read as TEXT.
+  -- Markdown and HTML rows are left out: a range highlight beats a line
+  -- highlight whatever the priority, so it would erase heading and code
+  -- block colors. Treesitter is scoped to code cells and does not reach them.
   if range.out_sep and range.out_stop then
     local out_last = math.min(range.out_stop, total) - 1
-    if out_last > range.out_sep then
-      local ltxt = vim.api.nvim_buf_get_lines(buf, out_last, out_last + 1, false)[1] or ""
-      pcall(vim.api.nvim_buf_set_extmark, buf, nb.border_ns, range.out_sep, 0, {
-        end_row = out_last,
-        end_col = #ltxt,
-        hl_group = "JupynvimOutputText",
-        -- REPLACE, not combine: Vim's regex syntax (when active alongside
-        -- treesitter) colors any output line starting with "#" as
-        -- pythonComment, which bled through a combine mask and made printed
-        -- output like `# transpose` render gray. replace ignores the
-        -- underlying syntax/treesitter entirely so output is pure plain text.
-        hl_mode = "replace",
-        -- Win over treesitter (100), LSP semantic tokens (125) and anything
-        -- else. 250 was not always enough in real configs.
-        priority = 5000,
-      })
+    local row = range.out_sep
+    while row <= out_last do
+      while row <= out_last and out_rich[row] do row = row + 1 end
+      local run_end = row
+      while run_end + 1 <= out_last and not out_rich[run_end + 1] do run_end = run_end + 1 end
+      if row <= out_last and run_end > range.out_sep then
+        local ltxt = vim.api.nvim_buf_get_lines(buf, run_end, run_end + 1, false)[1] or ""
+        pcall(vim.api.nvim_buf_set_extmark, buf, nb.border_ns, row, 0, {
+          end_row = run_end,
+          end_col = #ltxt,
+          hl_group = "JupynvimOutputText",
+          -- REPLACE, not combine: Vim's regex syntax (when active alongside
+          -- treesitter) colors any output line starting with "#" as
+          -- pythonComment, which bled through a combine mask and made printed
+          -- output like `# transpose` render gray. replace ignores the
+          -- underlying syntax/treesitter entirely so output is pure plain text.
+          hl_mode = "replace",
+          -- Win over treesitter (100), LSP semantic tokens (125) and anything
+          -- else. 250 was not always enough in real configs.
+          priority = OUT_MASK_PRIORITY,
+        })
+      end
+      row = run_end + 1
     end
     -- After a marker line, the key that shows what it stands for. It stays
     -- out of the text because the undo file read back on the next open has

@@ -146,7 +146,23 @@ M._unicodify_math = unicodify_math
 
 -- ---------- helpers (must be declared before any caller) ----------
 
+-- Every mark goes through here. A cell output is indented (ctx.col: its
+-- lines start with that many spaces the renderer never sees), so columns
+-- shift right by it, and lines hung under a line get the same indent. Its
+-- marks also outrank the output's own plain-text mask (ctx.priority).
 local function set_mark(buf, ns, lnum, col, opts)
+  local off = cur_ctx and cur_ctx.col or 0
+  local boost = cur_ctx and cur_ctx.priority or 0
+  if off > 0 or boost > 0 then
+    opts = vim.deepcopy(opts)
+    col = col + off
+    if opts.end_col then opts.end_col = opts.end_col + off end
+    if boost > 0 then opts.priority = (opts.priority or 4096) + boost end
+    if off > 0 and opts.virt_lines and not opts.virt_lines_leftcol then
+      local pad = string.rep(" ", off)
+      for _, l in ipairs(opts.virt_lines) do table.insert(l, 1, { pad, "Normal" }) end
+    end
+  end
   pcall(vim.api.nvim_buf_set_extmark, buf, ns, lnum, col, opts)
 end
 
@@ -768,6 +784,9 @@ end
 --   below(lnum, virt_lines)        hang lines under a buffer line
 --   hide(lnum)                     a line is concealed whole
 --   lead, width, max_cols, max_rows
+--   col        lines start with this many spaces to skip (a cell output)
+--   priority   added to every mark's priority
+--   html       the lines are one HTML document, not markdown
 -- }
 function M.render(buf, ns, start_line, end_line, render_width, ctx)
   if not vim.api.nvim_buf_is_valid(buf) then return end
@@ -775,6 +794,14 @@ function M.render(buf, ns, start_line, end_line, render_width, ctx)
   if start_line >= total then return end
   end_line = math.min(end_line, total - 1)
   local lines = vim.api.nvim_buf_get_lines(buf, start_line, end_line + 1, false)
+  local off = ctx and ctx.col or 0
+  if off > 0 then
+    local pad = string.rep(" ", off)
+    for i, l in ipairs(lines) do
+      -- a shorter line (an empty output row) has nothing past the indent
+      lines[i] = l:sub(1, off) == pad and l:sub(off + 1) or ""
+    end
+  end
   cur_ctx = ctx
   if ctx and not ctx.width then ctx.width = render_width end
   local ok, err = pcall(M._render_lines, buf, ns, start_line, lines, render_width)
@@ -783,6 +810,12 @@ function M.render(buf, ns, start_line, end_line, render_width, ctx)
 end
 
 function M._render_lines(buf, ns, start_line, lines, render_width)
+  if cur_ctx and cur_ctx.html then
+    if #lines > 0 then
+      render_html_block(buf, ns, start_line, lines, 1, #lines, math.max((render_width or 80) - 1, 8))
+    end
+    return
+  end
   local heading_width = render_width or 60
   -- Pre-pass: raw HTML blocks (CommonMark rules), drawn by html.lua.
   local claimed = {}

@@ -26,6 +26,7 @@
 #      + output_view_spec.lua (outputs cut, expanded, hidden or given a number
 #      of lines, #37)
 #      + html_spec.lua (HTML and local images in markdown cells)
+#      + rich_output_spec.lua (Markdown(...) and HTML(...) outputs drawn, not raw)
 #   5. frame_layout.sh (real rendered screen via tmux: frame alignment across
 #      terminal-split / floating-window layout changes)
 #      remote_hl_screen.sh (real rendered screen via tmux: dashboard/explorer
@@ -164,7 +165,7 @@ section "remote-hl spec" "$?"
 for spec in remote_pick_open_spec remote_open_layout_spec dispatch_keys_spec deploy_probe_spec \
             keymap_override_spec image_b64_spec reopen_lsp_spec edit_nav_spec \
             multi_image_spec install_spec output_cache_spec stale_output_e2e output_view_spec \
-            html_spec; do
+            html_spec rich_output_spec; do
   out=$(nv --headless -u NONE -c "luafile $ROOT/tests/$spec.lua" -c 'cquit 3' 2>&1)
   rc=$?
   echo "$out" | tail -1

@@ -106,8 +106,10 @@ local function _out_key(cell)
     p[#p + 1] = (o.output_type or "?") .. (o._rev or "")
     p[#p + 1] = (type(t) == "string" and #t) or (type(t) == "table" and #t) or 0
     if d then
-      local tp = d["text/plain"]
-      p[#p + 1] = (type(tp) == "string" and #tp) or (type(tp) == "table" and #tp) or 0
+      for _, m in ipairs({ "text/plain", "text/markdown", "text/html" }) do
+        local v = d[m]
+        p[#p + 1] = (type(v) == "string" and #v) or (type(v) == "table" and #v) or 0
+      end
       p[#p + 1] = (d["image/png"] or d["image/gif"] or d["image/jpeg"]) and 1 or 0
     end
     if o.traceback then p[#p + 1] = "t" .. #o.traceback end
@@ -135,17 +137,27 @@ local function build(cell, expanded)
   local outputs = cell.outputs or {}
   local lines = {}
   local hides = {}   -- row of a stream's marker -> the lines it hides
-  -- The text an execute_result or display_data shows. A figure's repr stays
-  -- hidden behind its image.
+  -- The text an execute_result or display_data shows, and how it is drawn:
+  -- nil for plain text, "markdown" or "html" for rows render.lua styles. A
+  -- figure's repr stays hidden behind its image.
   local function result_text(o)
     local data = o.data or {}
     local text = _as_str(data["text/plain"])
+    local is_repr = text == "" or text:match("^<[%w._]+ object>$")
+      or text:match("^<[%w._]+ object at 0x[%x]+>$")
     if (data["image/png"] or data["image/gif"] or data["image/jpeg"])
-        and (text == "" or text:match("^<[Ff]igure ")
-             or text:match("^<[%w._]+ object>$")
-             or text:match("^<[%w._]+ object at 0x[%x]+>$")) then
+        and (is_repr or text:match("^<[Ff]igure ")) then
       return ""
     end
+    -- Markdown(...) sends its source as text/plain too, raw. Its text/markdown
+    -- is the same text, drawn as markdown.
+    local md = _as_str(data["text/markdown"])
+    if md:find("%S") then return md, "markdown" end
+    -- HTML is only drawn when the plain text says nothing, as HTML(...)'s
+    -- "<IPython.core.display.HTML object>". A DataFrame's text/plain table
+    -- reads better in a terminal than its HTML one.
+    local html = _as_str(data["text/html"])
+    if is_repr and html:find("%S") then return html, "html" end
     return text
   end
   -- Does any output after the i-th show more than blank lines? Blank rows at
@@ -201,12 +213,18 @@ local function build(cell, expanded)
     for i = #raw - tail + 1, #raw do emit(i) end
   end
 
+  -- rows of `lines` drawn as markdown or HTML: { first, last, kind }
+  local rich = {}
   for i, o in ipairs(outputs) do
     if o.output_type == "stream" then
       add_stream(_as_str(o.text), i)
     elseif o.output_type == "execute_result" or o.output_type == "display_data" then
-      local text = result_text(o)
-      if text ~= "" then add_text(text) end
+      local text, kind = result_text(o)
+      if text ~= "" then
+        local first = #lines + 1
+        add_text(text)
+        if kind then rich[#rich + 1] = { first, #lines, kind } end
+      end
     elseif o.output_type == "error" then
       local msg = _as_str(o.ename) .. ": " .. _as_str(o.evalue)
       if msg ~= ": " then add_text(msg) end
@@ -216,6 +234,13 @@ local function build(cell, expanded)
     end
   end
   while lines[#lines] == "  " or lines[#lines] == "" do table.remove(lines) end
+  do
+    local kept = {}
+    for _, s in ipairs(rich) do
+      if s[1] <= #lines then kept[#kept + 1] = { s[1], math.min(s[2], #lines), s[3] } end
+    end
+    rich = kept
+  end
 
   -- How many lines rows a..b stand for. A row is one line, and a stream's
   -- marker is every line it hides. Counted as rows, a marker that hid most
@@ -245,9 +270,21 @@ local function build(cell, expanded)
     for row in pairs(hides) do
       if row > #lines - tail then kept[row - drop] = true end
     end
-    lines, marks = shown, kept
+    -- Rich rows move with the cut. Markdown is drawn line by line, so the
+    -- head and tail of a cut one still draw; a cut HTML document would not
+    -- parse, so it stays plain text.
+    local moved = {}
+    for _, s in ipairs(rich) do
+      local cut = s[2] > head and s[1] <= #lines - tail
+      if not (cut and s[3] == "html") then
+        if s[1] <= head then moved[#moved + 1] = { s[1], math.min(s[2], head), s[3] } end
+        local a = math.max(s[1], #lines - tail + 1)
+        if a <= s[2] then moved[#moved + 1] = { a - drop, s[2] - drop, s[3] } end
+      end
+    end
+    lines, marks, rich = shown, kept, moved
   end
-  return lines, marks, next(marks) ~= nil, total
+  return lines, marks, next(marks) ~= nil, total, rich
 end
 
 -- A hidden output shows one line in its place saying what it holds, or
@@ -277,9 +314,10 @@ local function cached(cell)
   if cell._output_hidden then
     e.lines = stand_in(cell)
     e.marks = #e.lines > 0 and { [1] = "hidden" } or {}
+    e.rich = {}
   else
     local marks
-    e.lines, marks, e.cut = build(cell, cell._output_expanded)
+    e.lines, marks, e.cut, _, e.rich = build(cell, cell._output_expanded)
     e.marks = {}
     for row in pairs(marks) do e.marks[row] = "cut" end
   end
@@ -289,6 +327,13 @@ end
 
 function M.output_lines(cell)
   return cached(cell).lines
+end
+
+-- The rows of output_lines(cell) drawn as markdown or HTML, as a list of
+-- { first, last, kind } (1-based rows, kind "markdown" or "html"). The rest
+-- are plain text.
+function M.output_rich(cell)
+  return cached(cell).rich
 end
 
 -- The rows of output_lines(cell) that stand for something not shown, as
